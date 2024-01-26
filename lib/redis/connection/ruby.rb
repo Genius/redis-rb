@@ -286,7 +286,7 @@ class Redis
           ssl_sock = new(tcp_sock, ctx)
           ssl_sock.hostname = host
           ssl_sock.connect
-          ssl_sock.post_connection_check(host)
+          ssl_sock.post_connection_check(host) unless ctx.verify_mode == OpenSSL::SSL::VERIFY_NONE
 
           ssl_sock
         end
