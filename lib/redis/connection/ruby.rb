@@ -84,13 +84,13 @@ class Redis
           read_nonblock(nbytes)
 
         rescue *NBIO_READ_EXCEPTIONS
-          if IO.select([self], nil, nil, @timeout)
+          if wait_readable(@timeout)
             retry
           else
             raise Redis::TimeoutError
           end
         rescue *NBIO_WRITE_EXCEPTIONS
-          if IO.select(nil, [self], nil, @timeout)
+          if wait_writable(@timeout)
             retry
           else
             raise Redis::TimeoutError
@@ -106,13 +106,13 @@ class Redis
           write_nonblock(data)
 
         rescue *NBIO_WRITE_EXCEPTIONS
-          if IO.select(nil, [self], nil, @write_timeout)
+          if wait_readable(@write_timeout)
             retry
           else
             raise Redis::TimeoutError
           end
         rescue *NBIO_READ_EXCEPTIONS
-          if IO.select([self], nil, nil, @write_timeout)
+          if wait_writable(@write_timeout)
             retry
           else
             raise Redis::TimeoutError
@@ -198,9 +198,7 @@ class Redis
           begin
             sock.connect_nonblock(sockaddr)
           rescue Errno::EINPROGRESS
-            if IO.select(nil, [sock], nil, timeout) == nil
-              raise TimeoutError
-            end
+            raise TimeoutError unless sock.wait_writable(timeout)
 
             begin
               sock.connect_nonblock(sockaddr)
@@ -256,9 +254,7 @@ class Redis
           begin
             sock.connect_nonblock(sockaddr)
           rescue Errno::EINPROGRESS
-            if IO.select(nil, [sock], nil, timeout) == nil
-              raise TimeoutError
-            end
+            raise TimeoutError unless sock.wait_writable(timeout)
 
             begin
               sock.connect_nonblock(sockaddr)
@@ -276,6 +272,18 @@ class Redis
       class SSLSocket < ::OpenSSL::SSL::SSLSocket
         include SocketMixin
 
+        unless method_defined?(:wait_readable)
+          def wait_readable(timeout = nil)
+            to_io.wait_readable(timeout)
+          end
+        end
+
+        unless method_defined?(:wait_writable)
+          def wait_writable(timeout = nil)
+            to_io.wait_writable(timeout)
+          end
+        end
+
         def self.connect(host, port, timeout, ssl_params)
           # Note: this is using Redis::Connection::TCPSocket
           tcp_sock = TCPSocket.connect(host, port, timeout)
@@ -285,7 +293,29 @@ class Redis
 
           ssl_sock = new(tcp_sock, ctx)
           ssl_sock.hostname = host
-          ssl_sock.connect
+
+          begin
+            # Initiate the socket connection in the background. If it doesn't fail
+            # immediately it will raise an IO::WaitWritable (Errno::EINPROGRESS)
+            # indicating the connection is in progress.
+            # Unlike waiting for a tcp socket to connect, you can't time out ssl socket
+            # connections during the connect phase properly, because IO.select only partially works.
+            # Instead, you have to retry.
+            ssl_sock.connect_nonblock
+          rescue Errno::EAGAIN, Errno::EWOULDBLOCK, IO::WaitReadable
+            if ssl_sock.wait_readable(timeout)
+              retry
+            else
+              raise TimeoutError
+            end
+          rescue IO::WaitWritable
+            if ssl_sock.wait_writable(timeout)
+              retry
+            else
+              raise TimeoutError
+            end
+          end
+
           ssl_sock.post_connection_check(host) unless ctx.verify_mode == OpenSSL::SSL::VERIFY_NONE
 
           ssl_sock
